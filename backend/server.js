@@ -13,6 +13,7 @@ const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 
+const pool = require('./db'); // PostgreSQL pool
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -107,19 +108,16 @@ const transporter = nodemailer.createTransport({
 });
 
 
-// 1️⃣ Update statuses (every minute)
+// 1️⃣ Update event statuses (every minute)
 cron.schedule('* * * * *', async () => {
   try {
     const sql = `
       UPDATE schedule_events
-      SET status =
-        CASE
-          WHEN NOW() BETWEEN (start_date + start_time) AND (end_date + end_time)
-            THEN 'active'
-          WHEN NOW() > (end_date + end_time)
-            THEN 'ended'
-          ELSE 'upcoming'
-        END
+      SET status = CASE
+        WHEN NOW() BETWEEN (start_date + start_time) AND (end_date + end_time) THEN 'active'
+        WHEN NOW() > (end_date + end_time) THEN 'ended'
+        ELSE 'upcoming'
+      END
     `;
     await pool.query(sql);
     io.emit('statusUpdated');
@@ -143,14 +141,14 @@ cron.schedule('0 0 * * *', async () => {
   }
 });
 
-// 3️⃣ Notification job (every 5 minutes)
+// 3️⃣ Notification job (every 5 minutes, 10 minutes before event)
 cron.schedule('*/5 * * * *', async () => {
   try {
     const sql = `
       SELECT id, program AS title, participants, start_date, start_time, notified
       FROM schedule_events
       WHERE (notified = false OR notified IS NULL)
-        AND (start_date + start_time) BETWEEN NOW() AND (NOW() + INTERVAL '1 hour')
+        AND (start_date + start_time) BETWEEN (NOW() + INTERVAL '10 minutes') AND (NOW() + INTERVAL '15 minutes')
     `;
     const { rows: events } = await pool.query(sql);
 
@@ -163,7 +161,7 @@ cron.schedule('*/5 * * * *', async () => {
         continue;
       }
 
-      // Prepare dynamic placeholders for parameterized query
+      // Build parameter placeholders for PostgreSQL
       const placeholders = participants.map((_, i) => `$${i + 1}`).join(',');
       const userSql = `SELECT email FROM categories WHERE office IN (${placeholders})`;
       const { rows: users } = await pool.query(userSql, participants);
@@ -186,6 +184,7 @@ cron.schedule('*/5 * * * *', async () => {
         }
       }
 
+      // Mark event as notified
       await pool.query('UPDATE schedule_events SET notified = true WHERE id = $1', [event.id]);
     }
   } catch (err) {
