@@ -106,24 +106,22 @@ const transporter = nodemailer.createTransport({
   tls: { rejectUnauthorized: false }
 });
 
-// --- CRON JOBS (MySQL-compatible SQL) ---
 
-// 1) Update statuses (every minute)
+// 1️⃣ Update statuses (every minute)
 cron.schedule('* * * * *', async () => {
   try {
     const sql = `
       UPDATE schedule_events
       SET status =
         CASE
-          WHEN NOW() BETWEEN CONCAT(start_date, ' ', start_time) AND CONCAT(end_date, ' ', end_time)
+          WHEN NOW() BETWEEN (start_date + start_time) AND (end_date + end_time)
             THEN 'active'
-          WHEN NOW() > CONCAT(end_date, ' ', end_time)
+          WHEN NOW() > (end_date + end_time)
             THEN 'ended'
           ELSE 'upcoming'
         END
     `;
-    const [res] = await pool.query(sql);
-    // res.affectedRows may be present depending on driver
+    await pool.query(sql);
     io.emit('statusUpdated');
     console.log('✅ [cron] Event statuses updated');
   } catch (err) {
@@ -131,50 +129,48 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
-// 2) Delete expired events (daily at midnight)
+// 2️⃣ Delete expired events (daily at midnight)
 cron.schedule('0 0 * * *', async () => {
   try {
-    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-    const sql = `DELETE FROM schedule_events WHERE CONCAT(end_date, ' ', end_time) < ?`;
-    const [result] = await pool.query(sql, [now]);
-    const affected = result && (result.affectedRows ?? result.affectedRows === 0 ? result.affectedRows : result.rowCount);
-    console.log(`🧹 [cron] Deleted ${affected || 0} expired event(s).`);
+    const sql = `
+      DELETE FROM schedule_events
+      WHERE (end_date + end_time) < NOW()
+    `;
+    const res = await pool.query(sql);
+    console.log(`🧹 [cron] Deleted ${res.rowCount} expired event(s).`);
   } catch (err) {
     console.error('❌ [cron] Failed to delete expired events:', err.message || err);
   }
 });
 
-// 3) Notification job (every 5 minutes)
+// 3️⃣ Notification job (every 5 minutes)
 cron.schedule('*/5 * * * *', async () => {
   try {
     const sql = `
       SELECT id, program AS title, participants, start_date, start_time, notified
       FROM schedule_events
-      WHERE (notified = 0 OR notified IS NULL)
-        AND TIMESTAMP(start_date, start_time) BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 1 HOUR)
+      WHERE (notified = false OR notified IS NULL)
+        AND (start_date + start_time) BETWEEN NOW() AND (NOW() + INTERVAL '1 hour')
     `;
-    const [events] = await pool.query(sql);
-    if (!Array.isArray(events) || events.length === 0) {
-      // nothing to notify
-      return;
-    }
+    const { rows: events } = await pool.query(sql);
+
+    if (!Array.isArray(events) || events.length === 0) return;
 
     for (const event of events) {
       const participants = safeJSONParse(event.participants, []);
       if (!participants.length) {
-        // optionally mark notified to avoid repeated attempts
-        await pool.query('UPDATE schedule_events SET notified = 1 WHERE id = ?', [event.id]);
+        await pool.query('UPDATE schedule_events SET notified = true WHERE id = $1', [event.id]);
         continue;
       }
 
-      // Build placeholders for IN
-      const placeholders = participants.map(() => '?').join(',');
+      // Prepare dynamic placeholders for parameterized query
+      const placeholders = participants.map((_, i) => `$${i + 1}`).join(',');
       const userSql = `SELECT email FROM categories WHERE office IN (${placeholders})`;
-      const [users] = await pool.query(userSql, participants);
+      const { rows: users } = await pool.query(userSql, participants);
 
-      if (Array.isArray(users) && users.length) {
+      if (users.length) {
         for (const user of users) {
-          const reminderMsg = `Reminder: You have an event "${event.title || event.program}" starting at ${formatManilaDateTime(event.start_date, event.start_time)}.`;
+          const reminderMsg = `Reminder: You have an event "${event.title}" starting at ${formatManilaDateTime(event.start_date, event.start_time)}.`;
           const mailOptions = {
             from: process.env.EMAIL_USER,
             to: user.email,
@@ -190,31 +186,23 @@ cron.schedule('*/5 * * * *', async () => {
         }
       }
 
-      // Mark event as notified (int 1)
-      try {
-        await pool.query('UPDATE schedule_events SET notified = 1 WHERE id = ?', [event.id]);
-      } catch (errUpdate) {
-        console.error(`❌ [cron] Failed to mark event ${event.id} as notified:`, errUpdate.message || errUpdate);
-      }
+      await pool.query('UPDATE schedule_events SET notified = true WHERE id = $1', [event.id]);
     }
   } catch (err) {
     console.error('❌ [cron] Failed to fetch upcoming events for notification:', err.message || err);
   }
 });
 
-// 4) Weekly reset (Sunday midnight)
+// 4️⃣ Weekly reset (Sunday midnight)
 cron.schedule('0 0 * * 0', async () => {
   try {
-    const [res] = await pool.query('DELETE FROM schedule_events');
-    const affected = res && (res.affectedRows ?? res.rowCount ?? 0);
-    console.log(`🔄 [cron] All events have been reset (deleted). Rows deleted: ${affected}`);
+    const res = await pool.query('DELETE FROM schedule_events');
+    console.log(`🔄 [cron] All events have been reset (deleted). Rows deleted: ${res.rowCount}`);
     io.emit('statusUpdated');
   } catch (err) {
     console.error('❌ [cron] Failed to reset events weekly:', err.message || err);
   }
 });
-
-
 // FORGOT PASSWORD
 app.post('/api/forgot-password', (req, res) => {
   const { email } = req.body;
