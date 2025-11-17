@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
+const { safeJSONParse, formatManilaDateTime } = require('./utils');
 
 const pool = require('./db'); // PostgreSQL pool
 const app = express();
@@ -141,18 +142,18 @@ cron.schedule('0 0 * * *', async () => {
   }
 });
 
-// 3️⃣ Notification job (every 5 minutes, 10 minutes before event)
+// 3️⃣ Optimized Notification job (every 5 minutes, 10 minutes before event)
 cron.schedule('*/5 * * * *', async () => {
   try {
     const sql = `
-      SELECT id, program AS title, participants, start_date, start_time, notified
+      SELECT id, program AS title, participants, start_date, start_time
       FROM schedule_events
       WHERE (notified = false OR notified IS NULL)
         AND (start_date + start_time) BETWEEN (NOW() + INTERVAL '10 minutes') AND (NOW() + INTERVAL '15 minutes')
     `;
     const { rows: events } = await pool.query(sql);
 
-    if (!Array.isArray(events) || events.length === 0) return;
+    if (!events.length) return;
 
     for (const event of events) {
       const participants = safeJSONParse(event.participants, []);
@@ -161,34 +162,38 @@ cron.schedule('*/5 * * * *', async () => {
         continue;
       }
 
-      // Build parameter placeholders for PostgreSQL
-      const placeholders = participants.map((_, i) => `$${i + 1}`).join(',');
-      const userSql = `SELECT email FROM categories WHERE office IN (${placeholders})`;
-      const { rows: users } = await pool.query(userSql, participants);
+      // Fetch all participant emails efficiently
+      const userSql = `
+        SELECT email
+        FROM categories
+        WHERE office = ANY($1::text[])
+      `;
+      const { rows: users } = await pool.query(userSql, [participants]);
 
       if (users.length) {
-        for (const user of users) {
+        // Send emails in parallel
+        const emailPromises = users.map(user => {
           const reminderMsg = `Reminder: You have an event "${event.title}" starting at ${formatManilaDateTime(event.start_date, event.start_time)}.`;
-          const mailOptions = {
+          return transporter.sendMail({
             from: process.env.EMAIL_USER,
             to: user.email,
             subject: 'Event Reminder',
             text: reminderMsg
-          };
-          try {
-            await transporter.sendMail(mailOptions);
-            console.log(`✅ [cron] Sent reminder to ${user.email} for event ${event.id}`);
-          } catch (errMail) {
-            console.error(`❌ [cron] Failed to send reminder to ${user.email}:`, errMail);
-          }
-        }
+          }).then(() => {
+            console.log(`✅ Sent reminder to ${user.email} for event ${event.id}`);
+          }).catch(errMail => {
+            console.error(`❌ Failed to send reminder to ${user.email}:`, errMail);
+          });
+        });
+
+        await Promise.all(emailPromises);
       }
 
       // Mark event as notified
       await pool.query('UPDATE schedule_events SET notified = true WHERE id = $1', [event.id]);
     }
   } catch (err) {
-    console.error('❌ [cron] Failed to fetch upcoming events for notification:', err.message || err);
+    console.error('❌ Failed to fetch upcoming events for notification:', err.message || err);
   }
 });
 
@@ -196,10 +201,10 @@ cron.schedule('*/5 * * * *', async () => {
 cron.schedule('0 0 * * 0', async () => {
   try {
     const res = await pool.query('DELETE FROM schedule_events');
-    console.log(`🔄 [cron] All events have been reset (deleted). Rows deleted: ${res.rowCount}`);
+    console.log(`🔄 All events have been reset (deleted). Rows deleted: ${res.rowCount}`);
     io.emit('statusUpdated');
   } catch (err) {
-    console.error('❌ [cron] Failed to reset events weekly:', err.message || err);
+    console.error('❌ Failed to reset events weekly:', err.message || err);
   }
 });
 // FORGOT PASSWORD
