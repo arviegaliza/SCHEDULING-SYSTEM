@@ -26,23 +26,28 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// --- MySQL pool (promise) ---
 const pool = mysql.createPool({
   connectionLimit: 100,
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
-  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : undefined,
+  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : undefined,
 });
 
-pool.getConnection((err, connection) => {
-  if (err) console.error('❌ DB connection failed:', err.message);
-  else {
+// Test connection
+(async () => {
+  try {
+    const conn = await pool.getConnection();
     console.log('✅ Connected to MySQL database');
-    connection.release();
+    conn.release();
+  } catch (err) {
+    console.error('❌ DB connection failed:', err.message || err);
   }
-});
+})();
 
+// --- Helpers ---
 function safeJSONParse(input, fallback = []) {
   try {
     return JSON.parse(input || '[]');
@@ -51,40 +56,37 @@ function safeJSONParse(input, fallback = []) {
   }
 }
 
-// Helper to format time in 12-hour format with am/pm
 function formatTime12h(timeStr) {
-  // timeStr is expected to be 'HH:mm:ss' or 'HH:mm'
-  const [hour, minute] = timeStr.split(':');
-  let h = parseInt(hour, 10);
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12;
+  if (!timeStr) return '';
+  const parts = timeStr.split(':');
+  const hour = parseInt(parts[0], 10);
+  const minute = parts[1] || '00';
+  let h = hour % 12;
   if (h === 0) h = 12;
+  const ampm = hour >= 12 ? 'PM' : 'AM';
   return `${h}:${minute} ${ampm}`;
 }
 
-// Improved helper to format Manila date and time for reminders, mimicking event schedule formatting
 function formatManilaDateTime(dateStr, timeStr) {
   if (!dateStr) return '';
   const date = new Date(dateStr);
   const formattedDate = date.toLocaleDateString('en-PH', { timeZone: 'Asia/Manila' });
   let formattedTime = '';
   if (timeStr) {
-    // Format time as HH:mm AM/PM
     const [hour, minute] = timeStr.split(':');
     const d = new Date();
-    d.setHours(hour, minute);
+    d.setHours(Number(hour), Number(minute || 0));
     formattedTime = d.toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Manila' });
   }
   return `${formattedDate}${formattedTime ? ' ' + formattedTime : ''}`;
 }
 
-// Helper to normalize participants
 function normalizeParticipants(participants) {
-  if (Array.isArray(participants)) return participants.map(p => p.trim().toLowerCase());
+  if (Array.isArray(participants)) return participants.map(p => String(p).trim().toLowerCase());
   if (typeof participants === 'string') {
     try {
       const arr = JSON.parse(participants);
-      if (Array.isArray(arr)) return arr.map(p => p.trim().toLowerCase());
+      if (Array.isArray(arr)) return arr.map(p => String(p).trim().toLowerCase());
       return [participants.trim().toLowerCase()];
     } catch {
       return [participants.trim().toLowerCase()];
@@ -93,106 +95,125 @@ function normalizeParticipants(participants) {
   return [];
 }
 
-// Cron jobs
-cron.schedule('* * * * *', () => {
-  const sql = `
-    UPDATE schedule_events SET status = 
-      CASE
-        WHEN NOW() BETWEEN CONCAT(start_date, ' ', start_time) AND CONCAT(end_date, ' ', end_time)
-          THEN 'active'
-        WHEN NOW() > CONCAT(end_date, ' ', end_time)
-          THEN 'ended'
-        ELSE 'upcoming'
-      END
-  `;
-  pool.query(sql, (err) => {
-    if (err) return console.error('❌ Failed to update statuses:', err.message);
+// --- Nodemailer transporter ---
+const transporter = nodemailer.createTransport({
+  service: 'Gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  },
+  // For dev only. Remove in production and fix certs properly.
+  tls: { rejectUnauthorized: false }
+});
+
+// --- CRON JOBS (MySQL-compatible SQL) ---
+
+// 1) Update statuses (every minute)
+cron.schedule('* * * * *', async () => {
+  try {
+    const sql = `
+      UPDATE schedule_events
+      SET status =
+        CASE
+          WHEN NOW() BETWEEN CONCAT(start_date, ' ', start_time) AND CONCAT(end_date, ' ', end_time)
+            THEN 'active'
+          WHEN NOW() > CONCAT(end_date, ' ', end_time)
+            THEN 'ended'
+          ELSE 'upcoming'
+        END
+    `;
+    const [res] = await pool.query(sql);
+    // res.affectedRows may be present depending on driver
     io.emit('statusUpdated');
-  });
+    console.log('✅ [cron] Event statuses updated');
+  } catch (err) {
+    console.error('❌ [cron] Failed to update statuses:', err.message || err);
+  }
 });
 
-cron.schedule('0 0 * * *', () => {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-  const sql = `DELETE FROM schedule_events WHERE CONCAT(end_date, ' ', end_time) < ?`;
-  pool.query(sql, [now], (err, results) => {
-    if (err) return console.error('❌ Failed to delete expired events:', err.message);
-    if (results.affectedRows > 0)
-      console.log(`🧹 Deleted ${results.affectedRows} expired event(s).`);
-  });
+// 2) Delete expired events (daily at midnight)
+cron.schedule('0 0 * * *', async () => {
+  try {
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const sql = `DELETE FROM schedule_events WHERE CONCAT(end_date, ' ', end_time) < ?`;
+    const [result] = await pool.query(sql, [now]);
+    const affected = result && (result.affectedRows ?? result.affectedRows === 0 ? result.affectedRows : result.rowCount);
+    console.log(`🧹 [cron] Deleted ${affected || 0} expired event(s).`);
+  } catch (err) {
+    console.error('❌ [cron] Failed to delete expired events:', err.message || err);
+  }
 });
 
-cron.schedule('*/5 * * * *', () => {
-  // Runs every 5 minutes
-  const sql = `
-    SELECT id, program AS title, participants, start_date, start_time, notified
-    FROM schedule_events
-    WHERE notified = 0
-      AND TIMESTAMP(start_date, start_time) BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 1 HOUR)
-  `;
-  pool.query(sql, (err, events) => {
-    if (err) {
-      console.error('❌ Failed to fetch upcoming events for notification:', err.message);
+// 3) Notification job (every 5 minutes)
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const sql = `
+      SELECT id, program AS title, participants, start_date, start_time, notified
+      FROM schedule_events
+      WHERE (notified = 0 OR notified IS NULL)
+        AND TIMESTAMP(start_date, start_time) BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 1 HOUR)
+    `;
+    const [events] = await pool.query(sql);
+    if (!Array.isArray(events) || events.length === 0) {
+      // nothing to notify
       return;
     }
-    events.forEach(event => {
-      let participants = [];
-      try {
-        participants = JSON.parse(event.participants);
-      } catch {
-        participants = [];
-      }
-      if (!participants.length) return;
 
-      // Get emails for all participants (assuming participants are office names)
+    for (const event of events) {
+      const participants = safeJSONParse(event.participants, []);
+      if (!participants.length) {
+        // optionally mark notified to avoid repeated attempts
+        await pool.query('UPDATE schedule_events SET notified = 1 WHERE id = ?', [event.id]);
+        continue;
+      }
+
+      // Build placeholders for IN
       const placeholders = participants.map(() => '?').join(',');
       const userSql = `SELECT email FROM categories WHERE office IN (${placeholders})`;
-      pool.query(userSql, participants, (err2, users) => {
-        if (err2) {
-          console.error('❌ Failed to fetch participant emails:', err2);
-          return;
-        }
-        users.forEach(user => {
-          const reminderMsg = `Reminder: You have an event "${event.program || event.title}" starting at ${formatManilaDateTime(event.start_date, event.start_time)}.`;
+      const [users] = await pool.query(userSql, participants);
+
+      if (Array.isArray(users) && users.length) {
+        for (const user of users) {
+          const reminderMsg = `Reminder: You have an event "${event.title || event.program}" starting at ${formatManilaDateTime(event.start_date, event.start_time)}.`;
           const mailOptions = {
             from: process.env.EMAIL_USER,
             to: user.email,
             subject: 'Event Reminder',
             text: reminderMsg
           };
-          transporter.sendMail(mailOptions, (err3) => {
-            if (err3) {
-              console.error(`❌ Failed to send reminder to ${user.email}:`, err3);
-            } else {
-              console.log(`✅ Sent reminder to ${user.email} for event ${event.id}`);
-            }
-          });
-        });
-        // Mark event as notified after sending to all
-        pool.query('UPDATE schedule_events SET notified = 1 WHERE id = ?', [event.id]);
-      });
-    });
-  });
-});
+          try {
+            await transporter.sendMail(mailOptions);
+            console.log(`✅ [cron] Sent reminder to ${user.email} for event ${event.id}`);
+          } catch (errMail) {
+            console.error(`❌ [cron] Failed to send reminder to ${user.email}:`, errMail);
+          }
+        }
+      }
 
-// Reset all events every week (Sunday at midnight)
-cron.schedule('0 0 * * 0', () => {
-  pool.query('DELETE FROM schedule_events', (err, results) => {
-    if (err) return console.error('❌ Failed to reset events weekly:', err.message);
-    console.log('🔄 All events have been reset (deleted) for the new week.');
-    io.emit('statusUpdated');
-  });
-});
-
-const transporter = nodemailer.createTransport({
-  service: 'Gmail',
-  auth: {
-    user: process.env.EMAIL_USER, // or your actual email
-    pass: process.env.EMAIL_PASS  // or your app password
-  },
-  tls: {
-    rejectUnauthorized: false
+      // Mark event as notified (int 1)
+      try {
+        await pool.query('UPDATE schedule_events SET notified = 1 WHERE id = ?', [event.id]);
+      } catch (errUpdate) {
+        console.error(`❌ [cron] Failed to mark event ${event.id} as notified:`, errUpdate.message || errUpdate);
+      }
+    }
+  } catch (err) {
+    console.error('❌ [cron] Failed to fetch upcoming events for notification:', err.message || err);
   }
 });
+
+// 4) Weekly reset (Sunday midnight)
+cron.schedule('0 0 * * 0', async () => {
+  try {
+    const [res] = await pool.query('DELETE FROM schedule_events');
+    const affected = res && (res.affectedRows ?? res.rowCount ?? 0);
+    console.log(`🔄 [cron] All events have been reset (deleted). Rows deleted: ${affected}`);
+    io.emit('statusUpdated');
+  } catch (err) {
+    console.error('❌ [cron] Failed to reset events weekly:', err.message || err);
+  }
+});
+
 
 // FORGOT PASSWORD
 app.post('/api/forgot-password', (req, res) => {
